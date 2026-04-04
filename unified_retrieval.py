@@ -18,6 +18,11 @@ class UnifiedRetrieval(TwoTowerBasic):
     At inference time, we can call whichever path we want:
     - tower path: fast matmul retrieval over cached item embeddings
     - generative path: decode semantic IDs token by token
+
+    Unified ``train_forward`` API:
+    - used: ``user_sequence_features``, ``user_static_features``, ``item_static_features``,
+      ``semantic_ids``, optional ``reward_weights``
+    - ignored: ``cluster_ids``, ``candidate_item_static_features``
     """
 
     def __init__(
@@ -84,7 +89,15 @@ class UnifiedRetrieval(TwoTowerBasic):
         self.semantic_loss_fn = nn.CrossEntropyLoss(reduction="none")
 
     def _build_static_tokens(self, user_static_features: torch.Tensor) -> torch.Tensor:
-        # Accept either compact static features [B, F] or pre-tokenized static tokens [B, S, D].
+        """Convert static user inputs into static tokens.
+
+        Args:
+            user_static_features: Static features ``[B, F]`` or static tokens
+                ``[B, S_static, hidden_dim]``.
+
+        Returns:
+            Static tokens with shape ``[B, S_static, hidden_dim]``.
+        """
         if user_static_features.dim() == 3:
             if user_static_features.size(-1) != self.user_token_projection.out_features:
                 raise ValueError(
@@ -105,6 +118,16 @@ class UnifiedRetrieval(TwoTowerBasic):
         user_sequence_features: torch.Tensor,
         user_static_features: torch.Tensor,
     ) -> torch.Tensor:
+        """Encode users into decoder cross-attention memory tokens.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static features ``[B, F]`` or static tokens
+                ``[B, S_static, hidden_dim]``.
+
+        Returns:
+            User memory tokens with shape ``[B, L + S_static, hidden_dim]``.
+        """
         # sequence: [B, L] -> [B, L, user_embedding_dim] -> [B, L, hidden_dim]
         seq_embeds = self.user_embedding(user_sequence_features)
         seq_hidden = self.user_token_projection(seq_embeds)
@@ -121,7 +144,15 @@ class UnifiedRetrieval(TwoTowerBasic):
         return user_memory
 
     def _causal_mask(self, target_len: int, device: torch.device) -> torch.Tensor:
-        # True entries are masked; [T, T]
+        """Build a causal self-attention mask.
+
+        Args:
+            target_len: Number of generated steps ``T``.
+            device: Device where the mask should be allocated.
+
+        Returns:
+            Boolean causal mask with shape ``[T, T]``.
+        """
         return torch.triu(
             torch.ones(target_len, target_len, dtype=torch.bool, device=device), diagonal=1
         )
@@ -132,6 +163,16 @@ class UnifiedRetrieval(TwoTowerBasic):
         semantic_ids: torch.Tensor,
         reward_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Compute semantic cross-entropy loss using teacher forcing.
+
+        Args:
+            user_memory: Decoder memory tokens with shape ``[B, L_user, hidden_dim]``.
+            semantic_ids: Semantic token ids with shape ``[B, S]`` including BOS.
+            reward_weights: Optional per-example weights with shape ``[B]``.
+
+        Returns:
+            Scalar semantic generation loss tensor.
+        """
         device = semantic_ids.device
         if semantic_ids.size(1) != self.semantic_seq_len:
             raise ValueError(
@@ -164,10 +205,30 @@ class UnifiedRetrieval(TwoTowerBasic):
         user_sequence_features: torch.Tensor,
         user_static_features: torch.Tensor,
         item_static_features: torch.Tensor,
-        semantic_ids: torch.Tensor,
         reward_weights: Optional[torch.Tensor] = None,
+        cluster_ids: Optional[torch.Tensor] = None,
+        semantic_ids: Optional[torch.Tensor] = None,
+        candidate_item_static_features: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Joint objective: retrieval sampled-softmax + semantic generation loss."""
+        """Compute the joint retrieval + semantic generation objective.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static features ``[B, F]`` or static tokens
+                ``[B, S_static, hidden_dim]``.
+            item_static_features: Positive item features with shape ``[B, F2]``.
+            reward_weights: Optional per-example weights with shape ``[B]``.
+            cluster_ids: Unused in this class.
+            semantic_ids: Semantic token targets with shape ``[B, S]`` (required).
+            candidate_item_static_features: Unused in this class.
+
+        Returns:
+            Dictionary with scalar tensors: ``loss``, ``tower_loss``,
+            and ``generation_loss``.
+        """
+        del cluster_ids, candidate_item_static_features
+        if semantic_ids is None:
+            raise ValueError("semantic_ids is required for UnifiedRetrieval.")
         # Tower branch (inherited): [B, L]/[B, F1]/[B, F2] -> sampled-softmax loss.
         tower_loss = super().train_forward(
             user_sequence_features=user_sequence_features,
@@ -199,9 +260,16 @@ class UnifiedRetrieval(TwoTowerBasic):
         user_static_features: torch.Tensor,
         bos_token_id: int,
     ) -> torch.Tensor:
-        """Greedy generation path for semantic IDs.
+        """Generate semantic ids greedily from the unified decoder branch.
 
-        Returns [B, semantic_seq_len] token IDs including BOS at position 0.
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static features ``[B, F]`` or static tokens
+                ``[B, S_static, hidden_dim]``.
+            bos_token_id: Token id to seed generation at position 0.
+
+        Returns:
+            Generated semantic id sequences with shape ``[B, semantic_seq_len]``.
         """
         device = user_sequence_features.device
         user_memory = self._encode_user_tokens(user_sequence_features, user_static_features)
@@ -229,7 +297,17 @@ class UnifiedRetrieval(TwoTowerBasic):
         topk: int = 10,
         return_all_scores: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """Two-tower inference path over cached item embeddings."""
+        """Run the two-tower inference path over cached item embeddings.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static user features with shape ``[B, F1]``.
+            topk: Number of items to return.
+            return_all_scores: If ``True``, include full score matrix.
+
+        Returns:
+            Retrieval dictionary from ``TwoTowerBasic.retrieve``.
+        """
         return self.retrieve(
             user_sequence_features=user_sequence_features,
             user_static_features=user_static_features,

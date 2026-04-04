@@ -28,6 +28,14 @@ class OOBNegativeSampler:
         self.filled = 0
 
     def _ingest(self, positives: torch.Tensor) -> None:
+        """Insert current positives into the rolling negative pool.
+
+        Args:
+            positives: Item-side feature tensor with shape ``[B, F2]``.
+
+        Returns:
+            None. Updates internal pool state in place.
+        """
         positives = positives.to(self.pool.device)
         for sample in positives:
             self.pool[self.write_ptr] = sample
@@ -35,13 +43,13 @@ class OOBNegativeSampler:
             self.filled = min(self.filled + 1, self.pool_size)
 
     def sample_negatives(self, positives: torch.Tensor) -> torch.Tensor:
-        """Return ``(B, oob_negative_count, F2)`` negatives and update the memory bank.
+        """Sample out-of-batch negatives and update the memory bank.
 
-        If the buffer is empty (first few steps) we simply repeat the positives so that
-        the downstream tower still works. Once the buffer has examples, we randomly
-        draw ``B * oob_negative_count`` old items following the spirit of Mixed Negative
-        Sampling: mix cached hard negatives with the current positives.
-        During warm-up this keeps the returned shape consistent for the encoder.
+        Args:
+            positives: Current positive item features with shape ``[B, F2]``.
+
+        Returns:
+            Sampled negatives with shape ``[B, oob_negative_count, F2]``.
         """
         batch_size = positives.shape[0]
         self._ingest(positives.detach())
@@ -58,7 +66,13 @@ class OOBNegativeSampler:
 
 
 class TwoTowerBasic(nn.Module):
-    """A minimal two-tower retriever meant for teaching."""
+    """A minimal two-tower retriever meant for teaching.
+
+    Unified ``train_forward`` API:
+    - used: ``user_sequence_features``, ``user_static_features``, ``item_static_features``,
+      optional ``reward_weights``
+    - ignored: ``cluster_ids``, ``semantic_ids``, ``candidate_item_static_features``
+    """
 
     def __init__(
         self,
@@ -112,6 +126,15 @@ class TwoTowerBasic(nn.Module):
         user_sequence_features: torch.Tensor,
         user_static_features: torch.Tensor,
     ) -> torch.Tensor:
+        """Encode user sequence and static features into a single vector.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static user features with shape ``[B, F1]``.
+
+        Returns:
+            User embedding tensor with shape ``[B, hidden_dim]``.
+        """
         # user_sequence_features: [B, L] -> embeddings [B, L, D]
         embeds = self.user_embedding(user_sequence_features)
         seq_flat = embeds.reshape(embeds.size(0), -1)
@@ -125,29 +148,49 @@ class TwoTowerBasic(nn.Module):
         return user_repr
 
     def _encode_items(self, item_static_features: torch.Tensor) -> torch.Tensor:
+        """Encode item-side static features into the retrieval space.
+
+        Args:
+            item_static_features: Item features with shape ``[N, F2]``.
+
+        Returns:
+            Item embeddings with shape ``[N, hidden_dim]``.
+        """
         # item_static_features: [B, F2]
         return self.item_encoder(item_static_features)
 
     def build_item_index(
         self,
         item_static_features: torch.Tensor,
-        item_ids: Optional[torch.Tensor] = None,
+        item_ids: torch.Tensor,
     ) -> None:
-        """Encode a pool of item statics and keep them in GPU memory for inference.
+        """Build a cached embedding index for inference-time retrieval.
 
-        ``item_static_features`` is ``(P, F2)`` where P is the pool size of items and
-        the stored embeddings are ``(P, hidden_dim)``.
+        Args:
+            item_static_features: Item pool features with shape ``[P, F2]``.
+            item_ids: Integer ids aligned to ``item_static_features``, shape ``[P]``.
+
+        Returns:
+            None. Stores cached embeddings and ids on the model instance.
         """
         embeddings = self._encode_items(item_static_features)
         self.cached_item_embeddings = embeddings.detach()
-        self.cached_item_ids = item_ids.clone() if item_ids is not None else None
+        self.cached_item_ids = item_ids.clone()
 
     def extend_item_index(
         self,
         item_static_features: torch.Tensor,
-        item_ids: Optional[torch.Tensor] = None,
+        item_ids: torch.Tensor,
     ) -> None:
-        """Append more items to the cached index without recomputing the whole pool."""
+        """Append additional items to the cached index.
+
+        Args:
+            item_static_features: New item features with shape ``[P_new, F2]``.
+            item_ids: Ids for the new items with shape ``[P_new]``.
+
+        Returns:
+            None. Extends cached embeddings and ids in place.
+        """
         embeddings = self._encode_items(item_static_features).detach()
         if self.cached_item_embeddings is None:
             self.cached_item_embeddings = embeddings
@@ -155,13 +198,12 @@ class TwoTowerBasic(nn.Module):
             self.cached_item_embeddings = torch.cat(
                 [self.cached_item_embeddings, embeddings], dim=0
             )
-        if item_ids is not None:
-            if self.cached_item_ids is None:
-                self.cached_item_ids = item_ids.clone()
-            else:
-                self.cached_item_ids = torch.cat(
-                    [self.cached_item_ids, item_ids.clone()], dim=0
-                )
+        if self.cached_item_ids is None:
+            self.cached_item_ids = item_ids.clone()
+        else:
+            self.cached_item_ids = torch.cat(
+                [self.cached_item_ids, item_ids.clone()], dim=0
+            )
 
     def retrieve(
         self,
@@ -170,14 +212,25 @@ class TwoTowerBasic(nn.Module):
         topk: int = 10,
         return_all_scores: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """Run a simple matmul between user repr and cached item embeddings for inference.
+        """Run top-k retrieval by matmul against cached item embeddings.
 
-        This relies on the cached item embeddings to stay resident in GPU memory. The
-        returned dictionary always contains ``scores`` and ``indices`` and optionally
-        ``item_ids`` / ``logits`` for diagnostics.
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static user features with shape ``[B, F1]``.
+            topk: Number of top candidates to return.
+            return_all_scores: If ``True``, include full logits ``[B, P]`` in output.
+
+        Returns:
+            Dictionary containing:
+            - ``scores``: Top-k scores, shape ``[B, topk]``.
+            - ``indices``: Top-k indices into cached item pool, shape ``[B, topk]``.
+            - ``item_ids``: Top-k business ids with shape ``[B, topk]``.
+            - ``logits`` (optional): Full score matrix when requested.
         """
         if self.cached_item_embeddings is None:
             raise RuntimeError("Call `build_item_index` before retrieval.")
+        if self.cached_item_ids is None:
+            raise RuntimeError("Item ids were not loaded. Rebuild index with item_ids.")
         user_repr = self._encode_user(user_sequence_features, user_static_features)
         # logits: [B, num_cached_items]
         logits = user_repr @ self.cached_item_embeddings.t()
@@ -185,8 +238,7 @@ class TwoTowerBasic(nn.Module):
         scores, indices = logits.topk(max_k, dim=-1)
         # scores: [B, topk], indices: [B, topk]
         result: Dict[str, torch.Tensor] = {"scores": scores, "indices": indices}
-        if self.cached_item_ids is not None:
-            result["item_ids"] = self.cached_item_ids[indices]
+        result["item_ids"] = self.cached_item_ids[indices]
         if return_all_scores:
             result["logits"] = logits
         return result
@@ -197,8 +249,25 @@ class TwoTowerBasic(nn.Module):
         user_static_features: torch.Tensor,
         item_static_features: torch.Tensor,
         reward_weights: Optional[torch.Tensor] = None,
+        cluster_ids: Optional[torch.Tensor] = None,
+        semantic_ids: Optional[torch.Tensor] = None,
+        candidate_item_static_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute logits for positives and out-of-batch negatives, return a weighted loss."""
+        """Compute sampled-softmax retrieval loss for the two-tower objective.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static user features with shape ``[B, F1]``.
+            item_static_features: Positive item features with shape ``[B, F2]``.
+            reward_weights: Optional per-example weights with shape ``[B]``.
+            cluster_ids: Unused in this class.
+            semantic_ids: Unused in this class.
+            candidate_item_static_features: Unused in this class.
+
+        Returns:
+            Scalar training loss tensor.
+        """
+        del cluster_ids, semantic_ids, candidate_item_static_features
         device = user_static_features.device
         user_repr = self._encode_user(user_sequence_features, user_static_features)
         positive_item = self._encode_items(item_static_features)

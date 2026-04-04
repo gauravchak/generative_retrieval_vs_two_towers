@@ -26,6 +26,14 @@ class MoEFFN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply gated mixture-of-experts feed-forward transformation.
+
+        Args:
+            x: Decoder hidden states with shape ``[B, T, D]``.
+
+        Returns:
+            MoE output with shape ``[B, T, D]``.
+        """
         # x: [B, T, D]
         gate_probs = torch.softmax(self.gate(x), dim=-1)
         # gate_probs: [B, T, num_experts]
@@ -77,6 +85,16 @@ class OneRecVDecoderBlock(nn.Module):
         user_memory: torch.Tensor,
         causal_mask: torch.Tensor,
     ) -> torch.Tensor:
+        """Run one decoder block in cross-attn -> self-attn -> MoE order.
+
+        Args:
+            generated_tokens: Generated-token states ``[B, T, D]``.
+            user_memory: User memory tokens for cross-attn ``[B, L_user, D]``.
+            causal_mask: Causal attention mask for self-attn ``[T, T]``.
+
+        Returns:
+            Updated generated-token states with shape ``[B, T, D]``.
+        """
         # generated_tokens: [B, T, D], user_memory: [B, L, D]
         cross_out, _ = self.cross_attn(
             query=generated_tokens,
@@ -106,6 +124,11 @@ class GenerativeRetrieval(TwoTowerBasic):
     Signature mirrors ``TwoTowerBasic.train_forward`` but adds ``semantic_ids: [B, S]``.
     ``semantic_ids`` is expected to include ``[BOS]`` so teacher forcing can use
     inputs ``[:, :-1]`` and targets ``[:, 1:]``.
+
+    Unified ``train_forward`` API:
+    - used: ``user_sequence_features``, ``user_static_features``, ``semantic_ids``,
+      optional ``reward_weights``
+    - ignored: ``item_static_features``, ``cluster_ids``, ``candidate_item_static_features``
     """
 
     def __init__(
@@ -171,11 +194,15 @@ class GenerativeRetrieval(TwoTowerBasic):
         user_sequence_features: torch.Tensor,
         user_static_features: torch.Tensor,
     ) -> torch.Tensor:
-        """Create lightweight user memory tokens for decoder cross-attention.
+        """Create user memory tokens used by decoder cross-attention.
 
-        sequence tokens: [B, L, user_embedding_dim] -> [B, L, hidden_dim]
-        static pathway: [B, user_static_dim] -> [B, S_static, hidden_dim]
-        concat on token axis: [B, L + S_static, hidden_dim]
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static features ``[B, F]`` or static tokens
+                ``[B, S_static, D]``.
+
+        Returns:
+            User memory tokens with shape ``[B, L + S_static, hidden_dim]``.
         """
         seq_embeds = self.user_embedding(user_sequence_features)
         # seq_embeds: [B, L, user_embedding_dim]
@@ -195,10 +222,14 @@ class GenerativeRetrieval(TwoTowerBasic):
         return user_memory
 
     def _build_static_tokens(self, user_static_features: torch.Tensor) -> torch.Tensor:
-        """Support both compact static features and pre-tokenized static features.
+        """Convert static features into static token embeddings.
 
-        - If input is [B, F_static], project to [B, S_static, hidden_dim].
-        - If input is already [B, S_static, hidden_dim], use it directly.
+        Args:
+            user_static_features: Static features ``[B, F_static]`` or pre-tokenized
+                static tokens ``[B, S_static, hidden_dim]``.
+
+        Returns:
+            Static tokens with shape ``[B, S_static, hidden_dim]``.
         """
         if user_static_features.dim() == 3:
             if user_static_features.size(-1) != self.user_token_projection.out_features:
@@ -216,7 +247,15 @@ class GenerativeRetrieval(TwoTowerBasic):
         )
 
     def _causal_mask(self, target_len: int, device: torch.device) -> torch.Tensor:
-        # True entries are masked; shape [T, T] for decoder self-attention.
+        """Build a causal mask for decoder self-attention.
+
+        Args:
+            target_len: Number of generated time steps ``T``.
+            device: Device where the mask should be allocated.
+
+        Returns:
+            Boolean mask with shape ``[T, T]`` where ``True`` entries are masked.
+        """
         return torch.triu(
             torch.ones(target_len, target_len, dtype=torch.bool, device=device), diagonal=1
         )
@@ -226,16 +265,30 @@ class GenerativeRetrieval(TwoTowerBasic):
         user_sequence_features: torch.Tensor,
         user_static_features: torch.Tensor,
         item_static_features: torch.Tensor,
-        semantic_ids: torch.Tensor,
         reward_weights: Optional[torch.Tensor] = None,
+        cluster_ids: Optional[torch.Tensor] = None,
+        semantic_ids: Optional[torch.Tensor] = None,
+        candidate_item_static_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Teacher-forcing loss over semantic IDs using OneRecV-style decoder blocks.
+        """Compute teacher-forcing semantic generation loss.
 
-        ``item_static_features`` is intentionally unused; we keep it for API compatibility
-        with the basic two-tower ``train_forward`` signature.
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static features ``[B, F]`` or static tokens
+                ``[B, S_static, D]``.
+            item_static_features: Unused in this class; kept for unified API.
+            reward_weights: Optional per-example weights with shape ``[B]``.
+            cluster_ids: Unused in this class.
+            semantic_ids: Semantic token targets with shape ``[B, S]`` (required).
+            candidate_item_static_features: Unused in this class.
+
+        Returns:
+            Scalar semantic generation loss tensor.
         """
-        del item_static_features
+        del item_static_features, cluster_ids, candidate_item_static_features
         device = user_static_features.device
+        if semantic_ids is None:
+            raise ValueError("semantic_ids is required for GenerativeRetrieval.")
         if semantic_ids.size(1) != self.semantic_seq_len:
             raise ValueError(
                 f"Expected semantic_ids with length {self.semantic_seq_len}, "

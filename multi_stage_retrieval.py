@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,6 +13,12 @@ class MultiStageRetrieval(TwoTowerBasic):
     By subclassing ``TwoTowerBasic`` we reuse the prefilter-stage encode / OOB sampler /
     cached item-index behavior and only add the overarch logic on top. That keeps the diff
     focused on the late-interaction reranker while still explaining the extra tensors.
+
+    Unified ``train_forward`` API:
+    - used: ``user_sequence_features``, ``user_static_features``,
+      ``candidate_item_static_features`` (or ``item_static_features`` if already [B, K, F2]),
+      optional ``reward_weights``
+    - ignored: ``cluster_ids``, ``semantic_ids``
     """
 
     def __init__(
@@ -67,20 +73,33 @@ class MultiStageRetrieval(TwoTowerBasic):
         self.item_pool_ids: Optional[torch.Tensor] = None
 
     def build_item_pool(
-        self, item_static_features: torch.Tensor, item_ids: Optional[torch.Tensor] = None
+        self, item_static_features: torch.Tensor, item_ids: torch.Tensor
     ) -> None:
-        """Repurpose ``TwoTowerBasic.build_item_index`` as the stage-1 cache.
+        """Build stage-1 retrieval cache and retain item statics for stage 2.
 
-        We also keep the raw static rows to re-encode selected candidates in stage 2.
+        Args:
+            item_static_features: Item pool features with shape ``[P, F2]``.
+            item_ids: Integer ids aligned to the pool, shape ``[P]``.
+
+        Returns:
+            None. Stores both cached embeddings and raw static features.
         """
         super().build_item_index(item_static_features, item_ids)
         self.item_pool_static = item_static_features.detach()
-        self.item_pool_ids = item_ids.clone() if item_ids is not None else None
+        self.item_pool_ids = item_ids.clone()
 
     def extend_item_pool(
-        self, item_static_features: torch.Tensor, item_ids: Optional[torch.Tensor] = None
+        self, item_static_features: torch.Tensor, item_ids: torch.Tensor
     ) -> None:
-        """Extend both the prefilter cache and the stored statics for stage 2 reranking."""
+        """Append additional items to stage-1 cache and stage-2 static store.
+
+        Args:
+            item_static_features: New item features with shape ``[P_new, F2]``.
+            item_ids: Ids aligned to new rows, shape ``[P_new]``.
+
+        Returns:
+            None. Updates in-memory item stores in place.
+        """
         super().extend_item_index(item_static_features, item_ids)
         if self.item_pool_static is None:
             self.item_pool_static = item_static_features.detach()
@@ -88,22 +107,24 @@ class MultiStageRetrieval(TwoTowerBasic):
             self.item_pool_static = torch.cat(
                 [self.item_pool_static, item_static_features.detach()], dim=0
             )
-        if item_ids is not None:
-            if self.item_pool_ids is None:
-                self.item_pool_ids = item_ids.clone()
-            else:
-                self.item_pool_ids = torch.cat(
-                    [self.item_pool_ids, item_ids.clone()], dim=0
-                )
+        if self.item_pool_ids is None:
+            self.item_pool_ids = item_ids.clone()
+        else:
+            self.item_pool_ids = torch.cat(
+                [self.item_pool_ids, item_ids.clone()], dim=0
+            )
 
     def _prefilter_scores(
         self, user_repr: torch.Tensor, candidate_item_static_features: torch.Tensor
     ) -> torch.Tensor:
-        """Dot product between the prefilter user vector and candidates.
+        """Compute prefilter-stage scores for candidate items.
 
-        user_repr: [B, hidden_dim]
-        candidate_item_static_features: [B, K, F2]
-        returns: [B, K]
+        Args:
+            user_repr: Prefilter user embeddings with shape ``[B, hidden_dim]``.
+            candidate_item_static_features: Candidate item features ``[B, K, F2]``.
+
+        Returns:
+            Prefilter candidate scores with shape ``[B, K]``.
         """
         b, k, f2 = candidate_item_static_features.shape
         flat = candidate_item_static_features.reshape(-1, f2)
@@ -111,7 +132,14 @@ class MultiStageRetrieval(TwoTowerBasic):
         return torch.sum(user_repr.unsqueeze(1) * item_repr, dim=-1)
 
     def _encode_overarch_candidates(self, candidate_item_static_features: torch.Tensor) -> torch.Tensor:
-        """Encode rerank candidates with the multi-head item encoder."""
+        """Encode stage-2 candidate items with the overarch item encoder.
+
+        Args:
+            candidate_item_static_features: Candidate item features ``[B, K, F2]``.
+
+        Returns:
+            Candidate embeddings with shape ``[B, K, head_dim]``.
+        """
         b, k, f2 = candidate_item_static_features.shape
         flat = candidate_item_static_features.reshape(-1, f2)
         item_repr = self.overarch._encode_items(flat)
@@ -125,7 +153,22 @@ class MultiStageRetrieval(TwoTowerBasic):
         prefilter_user: torch.Tensor,
         prefilter_scores: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Run the overarch stage using the multi-head reranker."""
+        """Run overarch reranking features and logits for stage-2 candidates.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static user features with shape ``[B, F1]``.
+            candidate_item_static_features: Candidate item features ``[B, K, F2]``.
+            prefilter_user: Prefilter user embeddings with shape ``[B, hidden_dim]``.
+            prefilter_scores: Stage-1 scores with shape ``[B, K]``.
+
+        Returns:
+            Dictionary with:
+            - ``logits``: Stage-2 logits ``[B, K]``.
+            - ``u_u_dots``: User-user head interactions ``[B, H]``.
+            - ``u_i_dots``: User-item head interactions ``[B, H, K]``.
+            - ``prefilter_scores``: Copied stage-1 scores ``[B, K]``.
+        """
         b, k, _ = candidate_item_static_features.shape
         user_heads = self.overarch._encode_user(
             user_sequence_features, user_static_features
@@ -161,10 +204,38 @@ class MultiStageRetrieval(TwoTowerBasic):
         self,
         user_sequence_features: torch.Tensor,
         user_static_features: torch.Tensor,
-        candidate_item_static_features: torch.Tensor,
+        item_static_features: torch.Tensor,
         reward_weights: Optional[torch.Tensor] = None,
+        cluster_ids: Optional[torch.Tensor] = None,
+        semantic_ids: Optional[torch.Tensor] = None,
+        candidate_item_static_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute the pointwise overarch loss on pre-selected candidates."""
+        """Compute pointwise stage-2 BCE loss for pre-selected candidates.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static user features with shape ``[B, F1]``.
+            item_static_features: Either unused placeholder ``[B, F2]`` or
+                candidate tensor ``[B, K, F2]`` when
+                ``candidate_item_static_features`` is not provided.
+            reward_weights: Optional labels/weights tensor with shape ``[B, K]``.
+            cluster_ids: Unused in this class.
+            semantic_ids: Unused in this class.
+            candidate_item_static_features: Optional explicit candidate features
+                with shape ``[B, K, F2]``.
+
+        Returns:
+            Tuple ``(loss, metrics)`` where ``loss`` is scalar and ``metrics`` contains
+            reranker intermediates such as logits and dot-product features.
+        """
+        del cluster_ids, semantic_ids
+        if candidate_item_static_features is None:
+            if item_static_features.dim() != 3:
+                raise ValueError(
+                    "MultiStageRetrieval expects candidate_item_static_features=[B,K,F2] "
+                    "or item_static_features already shaped [B,K,F2]."
+                )
+            candidate_item_static_features = item_static_features
         prefilter_user = self._encode_user(user_sequence_features, user_static_features)
         # prefilter_user: [B, hidden_dim]
         prefilter_scores = self._prefilter_scores(
@@ -192,9 +263,20 @@ class MultiStageRetrieval(TwoTowerBasic):
         user_static_features: torch.Tensor,
         topk: int = 32,
     ) -> Dict[str, torch.Tensor]:
-        """Prefilter via matmul KNN, then rerank with the overarch MLP."""
+        """Run two-stage inference: prefilter retrieval then overarch reranking.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static user features with shape ``[B, F1]``.
+            topk: Number of stage-1 candidates to rerank.
+
+        Returns:
+            Dictionary containing stage-1 outputs, stage-2 logits, and optional ids.
+        """
         if self.item_pool_static is None:
             raise RuntimeError("Call `build_item_pool` before running inference.")
+        if self.item_pool_ids is None:
+            raise RuntimeError("Item ids were not loaded. Rebuild pool with item_ids.")
         prefilter_result = self.retrieve(
             user_sequence_features, user_static_features, topk=topk, return_all_scores=True
         )
@@ -216,9 +298,8 @@ class MultiStageRetrieval(TwoTowerBasic):
             "overarch_scores": overarch["logits"],
             "candidate_indices": indices,
         }
-        if self.item_pool_ids is not None:
-            result["candidate_ids"] = self.item_pool_ids[flat_idx].view(
-                indices.size(0), indices.size(1)
-            )
+        result["candidate_ids"] = self.item_pool_ids[flat_idx].view(
+            indices.size(0), indices.size(1)
+        )
         result.update(overarch)
         return result

@@ -12,6 +12,11 @@ class MultiHeadTwoTower(TwoTowerBasic):
     This subclass only updates the user encoding to produce ``(B, H, head_dim)`` heads,
     replaces the item encoder with a lighter projection to ``head_dim``, and aggregates the
     per-head logits before reusing the base OOB sampler + loss infrastructure.
+
+    Unified ``train_forward`` API:
+    - used: ``user_sequence_features``, ``user_static_features``, ``item_static_features``,
+      optional ``reward_weights``
+    - ignored: ``cluster_ids``, ``semantic_ids``, ``candidate_item_static_features``
     """
 
     def __init__(
@@ -58,6 +63,15 @@ class MultiHeadTwoTower(TwoTowerBasic):
         )
 
     def _encode_user(self, user_sequence_features: torch.Tensor, user_static_features: torch.Tensor) -> torch.Tensor:
+        """Encode users into multiple interaction heads.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static user features with shape ``[B, F1]``.
+
+        Returns:
+            Multi-head user embeddings with shape ``[B, H, head_dim]``.
+        """
         # Sequence pipeline reuses the base embeddings from TwoTowerBasic.
         embeds = self.user_embedding(user_sequence_features)
         # embeds: [B, L, D]
@@ -73,6 +87,14 @@ class MultiHeadTwoTower(TwoTowerBasic):
         return heads.view(heads.size(0), self.num_heads, self.head_dim)
 
     def _aggregate_logits(self, head_scores: torch.Tensor) -> torch.Tensor:
+        """Aggregate per-head candidate logits into a single candidate score.
+
+        Args:
+            head_scores: Head-wise scores with shape ``[B, H, 1 + num_oob]``.
+
+        Returns:
+            Aggregated candidate logits with shape ``[B, 1 + num_oob]``.
+        """
         # head_scores: [B, H, 1 + num_oob], aggregator returns [B, 1 + num_oob]
         if self.aggregator == "max":
             return head_scores.max(dim=1).values
@@ -84,7 +106,25 @@ class MultiHeadTwoTower(TwoTowerBasic):
         user_static_features: torch.Tensor,
         item_static_features: torch.Tensor,
         reward_weights: Optional[torch.Tensor] = None,
+        cluster_ids: Optional[torch.Tensor] = None,
+        semantic_ids: Optional[torch.Tensor] = None,
+        candidate_item_static_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Compute multi-head sampled-softmax retrieval loss.
+
+        Args:
+            user_sequence_features: Sequence token ids with shape ``[B, L]``.
+            user_static_features: Static user features with shape ``[B, F1]``.
+            item_static_features: Positive item features with shape ``[B, F2]``.
+            reward_weights: Optional per-example weights with shape ``[B]``.
+            cluster_ids: Unused in this class.
+            semantic_ids: Unused in this class.
+            candidate_item_static_features: Unused in this class.
+
+        Returns:
+            Scalar training loss tensor.
+        """
+        del cluster_ids, semantic_ids, candidate_item_static_features
         device = user_static_features.device
         user_heads = self._encode_user(user_sequence_features, user_static_features)
         # user_heads: [B, H, head_dim]
