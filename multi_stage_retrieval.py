@@ -62,7 +62,6 @@ class MultiStageRetrieval(TwoTowerBasic):
             oob_pool_size=oob_pool_size,
             dropout=dropout,
         )
-        self.prefilter_user_projection = nn.Linear(hidden_dim, head_dim)
         self.overarch_mlp = nn.Sequential(
             nn.Linear(1 + 2 * head_dim, overarch_hidden),
             nn.ReLU(),
@@ -150,7 +149,6 @@ class MultiStageRetrieval(TwoTowerBasic):
         user_sequence_features: torch.Tensor,
         user_static_features: torch.Tensor,
         candidate_item_static_features: torch.Tensor,
-        prefilter_user: torch.Tensor,
         prefilter_scores: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """Run overarch reranking features and logits for stage-2 candidates.
@@ -159,7 +157,6 @@ class MultiStageRetrieval(TwoTowerBasic):
             user_sequence_features: Sequence token ids with shape ``[B, L]``.
             user_static_features: Static user features with shape ``[B, F1]``.
             candidate_item_static_features: Candidate item features ``[B, K, F2]``.
-            prefilter_user: Prefilter user embeddings with shape ``[B, hidden_dim]``.
             prefilter_scores: Stage-1 scores with shape ``[B, K]``.
 
         Returns:
@@ -178,9 +175,10 @@ class MultiStageRetrieval(TwoTowerBasic):
             candidate_item_static_features
         )
         # candidate_overarch_repr: [B, K, head_dim]
-        prefilter_user_proj = self.prefilter_user_projection(prefilter_user)
-        # prefilter_user_proj: [B, head_dim]
-        u_u_dots = torch.einsum("bhd,bd->bh", user_heads, prefilter_user_proj)
+        # Overarch-only user-user feature: dot each head with the overarch user centroid.
+        user_anchor = user_heads.mean(dim=1)
+        # user_anchor: [B, head_dim]
+        u_u_dots = torch.einsum("bhd,bd->bh", user_heads, user_anchor)
         # u_u_dots: [B, H]
         u_i_dots = torch.einsum("bhd,bkd->bhk", user_heads, candidate_overarch_repr)
         # u_i_dots: [B, H, K]
@@ -245,7 +243,6 @@ class MultiStageRetrieval(TwoTowerBasic):
             user_sequence_features,
             user_static_features,
             candidate_item_static_features,
-            prefilter_user,
             prefilter_scores,
         )
         logits = overarch["logits"]
@@ -290,7 +287,6 @@ class MultiStageRetrieval(TwoTowerBasic):
             user_sequence_features,
             user_static_features,
             candidate_statics,
-            self._encode_user(user_sequence_features, user_static_features),
             scores,
         )
         result: Dict[str, torch.Tensor] = {
