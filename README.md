@@ -1,4 +1,4 @@
-# A Unified Retrieval Argument
+# Unified Retrieval (over item id and semantic id)
 
 ## Core Claim
 This repository argues that generative retrieval and two-tower retrieval should not be treated as separate, competing systems.
@@ -178,6 +178,29 @@ Minimum serving setup:
 
 Bottom line:
 - Unified retrieval is a practical superset strategy: at least preserve current two-tower strength, while gaining a production-ready path to end-to-end generative retrieval.
+
+## Evaluation: Compare Routes with Bulk Recall
+To make this convincing in your own stack, evaluate all routes on the same held-out set.
+
+Routes to evaluate:
+- Two-tower retrieval route (`retrieve_with_tower`).
+- Generative route (`generate_semantic_ids`) mapped back to items via semantic-id lookup.
+- Optional hybrid route (union/rerank of tower and generative candidates).
+
+Recommended bulk evaluation protocol:
+- Use the same user query batch and same ground-truth positives for all routes.
+- Run offline bulk inference to avoid online noise and latency jitter.
+- Compute Recall@K for multiple K values (for example 10, 50, 100, 500).
+- Also track coverage (how many distinct positives each route can surface) and latency.
+
+Why this is important:
+- Tower route usually gives strong stable recall and excellent latency.
+- Generative route can recover different candidates and improve long-tail/semantic coverage.
+- Hybrid routing can outperform either alone by combining complementary candidate sets.
+
+A simple success criterion:
+- Jointly trained unified model should match or beat tower-only recall at practical K,
+  while adding a second inference path that contributes incremental positives.
 
 ## Evolution Diagram
 ```mermaid
