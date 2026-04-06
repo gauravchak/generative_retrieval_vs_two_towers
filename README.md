@@ -97,7 +97,8 @@ Why this step matters:
 ## Step 5: Add Generative Retrieval (`GenerativeRetrieval`)
 Now we add semantic-ID generation with teacher forcing:
 - User side stays intentionally light (history tokens + static tokens concatenated on token axis).
-- Decoder follows OneRecV-style block ordering:
+- Like [OneRec](https://arxiv.org/abs/2506.13695) we can build both a static pathway and then history token pathway for [B, 1+L, D] output since we don't need to limit ourselves to compressing all user knowledge into [B, D]
+- Decoder follows [OneRecV2](https://arxiv.org/abs/2508.20900)-style block ordering:
   1. cross-attention to user tokens
   2. self-attention on generated tokens
   3. MoE-FFN
