@@ -156,8 +156,9 @@ At inference, we expose two callable paths from the same trained model:
 
 Why this is the critical result:
 
-- We are no longer forced into an either/or choice between discriminative and generative retrieval.
-- We can keep the proven two-tower serving path and quality, while adding generative capability as a first-class option.
+- We are no longer forced into an either/or choice between item id and semantic id based retrieval.
+- The user info processing is done with both losses making it better than each individually.
+- Decoding is what is incremental to "generative retrieval" and we are able to leverage that.
 
 ```mermaid
 flowchart TD
@@ -184,7 +185,7 @@ Why this should be convincing to a skeptical reader:
 
 - It is additive: no need to throw away existing two-tower infrastructure.
 - It is testable: you can compare tower-only, generative-only, and joint training from the same data backbone.
-- It is operationally flexible: fast matmul retrieval remains available even after adding generation.
+- It is operationally flexible: KNN/fast matmul retrieval remains available even after adding generation.
 
 ## What You Need To Try This
 
