@@ -21,12 +21,13 @@ Why this step matters:
 - It gives us a stable anchor to compare all later variants.
 
 ## Step 2: Add Late Interaction (`MultiHeadTwoTower`)
-Next we add a ColBERT-style variant with minimal change:
+Next we add a [ColBERT](https://arxiv.org/abs/2004.12832)-style variant with minimal change:
 - Replace single user embedding with multiple user heads.
 - Keep item encoding and negative-sampling workflow familiar.
 - Aggregate head-wise similarities (max/logsumexp).
 
 Why this step matters:
+- It is a route to multi-interest or multi-objective modeling.
 - It shows richer interaction can be layered on top of the same two-tower foundation.
 - It keeps compatibility with the same data and training loop style.
 
@@ -61,7 +62,7 @@ Now we extend to a prefilter + overarch setup:
 - Reference: [Revisiting Neural Retrieval on Accelerators](https://arxiv.org/abs/2306.04039).
 
 Why this step matters:
-- It preserves serving efficiency while improving ranking expressiveness.
+- It preserves serving efficiency while improving accruacy since final set is also trained for accuracy not just recall.
 - It demonstrates that multi-stage retrieval is still compatible with the same base architecture.
 
 ```mermaid
@@ -91,6 +92,7 @@ Why this step matters:
 - Cluster targets are often easier to learn early.
 - Full-softmax cluster supervision quickly corrects coarse semantic mistakes.
 - This improves learning dynamics without discarding two-tower strengths.
+- As mentioned in [Efficient Item IG based generative retrieval](https://arxiv.org/pdf/2509.03746v1) this is a viable route to generative retrieval while not exposing one to the lossy compression of semantic ids.
 
 ## Step 5: Add Generative Retrieval (`GenerativeRetrieval`)
 Now we add semantic-ID generation with teacher forcing:
@@ -106,6 +108,7 @@ Why this step matters:
 - It adds a new end-to-end generative inference path for item prediction, not just
   KNN + overarch-style inference.
 - It does not require abandoning the existing two-tower ecosystem.
+- Note that the first token prediction is essentially still a two-tower setup. BOS token prpduces a summary by cross attention and then dot product with vocab token to produce probabilities. **It is in decoding future tokens that generative retrieval differentiates itself.**
 
 ```mermaid
 flowchart LR
@@ -123,9 +126,9 @@ flowchart LR
 
 ## Step 6: Close the Loop with Joint Training (`UnifiedRetrieval`)
 Finally, we combine both objectives in one model:
-- Tower sampled-softmax loss
-- Generative semantic-token loss
-- Weighted sum during training
+- Sampled-softmax loss for prefilter (single or multi-head) and potionally overarch loss.
+- Generative semantic-token full softmax loss
+- Weighted sum of losses during training
 
 At inference, we expose two callable paths from the same trained model:
 - `retrieve_with_tower(...)` for fast ANN/matmul style retrieval
