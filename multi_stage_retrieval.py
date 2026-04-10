@@ -114,7 +114,9 @@ class MultiStageRetrieval(TwoTowerBasic):
             )
 
     def _prefilter_scores(
-        self, user_repr: torch.Tensor, candidate_item_static_features: torch.Tensor
+        self,
+        user_repr: torch.Tensor,
+        candidate_item_static_features: torch.Tensor,
     ) -> torch.Tensor:
         """Compute prefilter-stage scores for candidate items.
 
@@ -125,12 +127,12 @@ class MultiStageRetrieval(TwoTowerBasic):
         Returns:
             Prefilter candidate scores with shape ``[B, K]``.
         """
-        b, k, f2 = candidate_item_static_features.shape
-        flat = candidate_item_static_features.reshape(-1, f2)
-        item_repr = self._encode_items(flat).view(b, k, -1)
-        return torch.sum(user_repr.unsqueeze(1) * item_repr, dim=-1)
+        item_repr = self._encode_items(candidate_item_static_features)
+        return torch.einsum("bd,bkd->bk", user_repr, item_repr)
 
-    def _encode_overarch_candidates(self, candidate_item_static_features: torch.Tensor) -> torch.Tensor:
+    def _encode_overarch_candidates(
+        self, candidate_item_static_features: torch.Tensor
+    ) -> torch.Tensor:
         """Encode stage-2 candidate items with the overarch item encoder.
 
         Args:
@@ -139,10 +141,7 @@ class MultiStageRetrieval(TwoTowerBasic):
         Returns:
             Candidate embeddings with shape ``[B, K, head_dim]``.
         """
-        b, k, f2 = candidate_item_static_features.shape
-        flat = candidate_item_static_features.reshape(-1, f2)
-        item_repr = self.overarch._encode_items(flat)
-        return item_repr.view(b, k, -1)
+        return self.overarch._encode_items(candidate_item_static_features)
 
     def _compute_overarch(
         self,
@@ -180,7 +179,9 @@ class MultiStageRetrieval(TwoTowerBasic):
         # user_anchor: [B, head_dim]
         u_u_dots = torch.einsum("bhd,bd->bh", user_heads, user_anchor)
         # u_u_dots: [B, H]
-        u_i_dots = torch.einsum("bhd,bkd->bhk", user_heads, candidate_overarch_repr)
+        u_i_dots = torch.einsum(
+            "bhd,bkd->bhk", user_heads, candidate_overarch_repr
+        )
         # u_i_dots: [B, H, K]
         u_u_features = u_u_dots.unsqueeze(1).expand(-1, k, -1)
         u_i_features = u_i_dots.permute(0, 2, 1)
@@ -234,7 +235,9 @@ class MultiStageRetrieval(TwoTowerBasic):
                     "or item_static_features already shaped [B,K,F2]."
                 )
             candidate_item_static_features = item_static_features
-        prefilter_user = self._encode_user(user_sequence_features, user_static_features)
+        prefilter_user = self._encode_user(
+            user_sequence_features, user_static_features
+        )
         # prefilter_user: [B, hidden_dim]
         prefilter_scores = self._prefilter_scores(
             prefilter_user, candidate_item_static_features
@@ -251,7 +254,13 @@ class MultiStageRetrieval(TwoTowerBasic):
             reward_weights[:, 0] = 1.0
         labels = (reward_weights > 0).float()
         losses = self.bce_loss(logits, labels)
-        loss = (losses * reward_weights).sum() / reward_weights.sum().clamp_min(1e-6)
+        valid_mask = reward_weights > 0
+        valid_weights = reward_weights[valid_mask]
+        total_weight = valid_weights.sum()
+        if total_weight < 1:
+            loss = losses.sum() * 0.0
+        else:
+            loss = (losses[valid_mask] * valid_weights).sum() / total_weight
         return loss, {**overarch, "labels": labels}
 
     def inference(
@@ -271,11 +280,18 @@ class MultiStageRetrieval(TwoTowerBasic):
             Dictionary containing stage-1 outputs, stage-2 logits, and optional ids.
         """
         if self.item_pool_static is None:
-            raise RuntimeError("Call `build_item_pool` before running inference.")
+            raise RuntimeError(
+                "Call `build_item_pool` before running inference."
+            )
         if self.item_pool_ids is None:
-            raise RuntimeError("Item ids were not loaded. Rebuild pool with item_ids.")
+            raise RuntimeError(
+                "Item ids were not loaded. Rebuild pool with item_ids."
+            )
         prefilter_result = self.retrieve(
-            user_sequence_features, user_static_features, topk=topk, return_all_scores=True
+            user_sequence_features,
+            user_static_features,
+            topk=topk,
+            return_all_scores=True,
         )
         scores = prefilter_result["scores"]
         indices = prefilter_result["indices"]

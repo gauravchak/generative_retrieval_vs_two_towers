@@ -45,7 +45,10 @@ class MultiHeadTwoTower(TwoTowerBasic):
             oob_negative_count=oob_negative_count,
             dropout=dropout,
         )
-        assert aggregator in {"max", "softmax"}, "aggregator must be max or softmax"
+        assert aggregator in {
+            "max",
+            "softmax",
+        }, "aggregator must be max or softmax"
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.aggregator = aggregator
@@ -62,7 +65,11 @@ class MultiHeadTwoTower(TwoTowerBasic):
             nn.Linear(hidden_dim, head_dim),
         )
 
-    def _encode_user(self, user_sequence_features: torch.Tensor, user_static_features: torch.Tensor) -> torch.Tensor:
+    def _encode_user(
+        self,
+        user_sequence_features: torch.Tensor,
+        user_static_features: torch.Tensor,
+    ) -> torch.Tensor:
         """Encode users into multiple interaction heads.
 
         Args:
@@ -126,22 +133,16 @@ class MultiHeadTwoTower(TwoTowerBasic):
         """
         del cluster_ids, semantic_ids, candidate_item_static_features
         device = user_static_features.device
-        user_heads = self._encode_user(user_sequence_features, user_static_features)
-        # user_heads: [B, H, head_dim]
-        positive_item = self._encode_items(item_static_features)
-        # positive_item: [B, head_dim]
-
-        negatives = self.oob_sampler.sample_negatives(item_static_features)
-        neg_flat = negatives.view(-1, item_static_features.shape[-1])
-        negative_repr = self._encode_items(neg_flat)
-        negative_repr = negative_repr.view(
-            item_static_features.size(0), negatives.size(1), -1
+        user_heads = self._encode_user(
+            user_sequence_features, user_static_features
         )
-        # negative_repr: [B, num_oob, head_dim]
+        # user_heads: [B, H, head_dim]
 
-        stacked_items = torch.cat([positive_item.unsqueeze(1), negative_repr], dim=1)
-        # stacked_items: [B, 1 + num_oob, head_dim]
-        head_scores = torch.einsum("bhd,bnd->bhn", user_heads, stacked_items)
+        candidates = self.oob_sampler.get_candidates(item_static_features)
+        candidate_repr = self._encode_items(candidates)
+        # candidate_repr: [B, 1 + num_oob, head_dim]
+
+        head_scores = torch.einsum("bhd,bnd->bhn", user_heads, candidate_repr)
         # head_scores: [B, H, 1 + num_oob]
         logits = self._aggregate_logits(head_scores)
         # logits: [B, 1 + num_oob]
@@ -149,6 +150,15 @@ class MultiHeadTwoTower(TwoTowerBasic):
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=device)
         # labels: [B], positive index is 0
         losses = self.loss_fn(logits, labels)
-        weights = reward_weights.to(device) if reward_weights is not None else torch.ones_like(losses)
-        loss = (losses * weights).sum() / weights.sum().clamp_min(1e-6)
+        if reward_weights is not None:
+            weights = reward_weights.to(device)
+            valid_mask = weights > 0
+            valid_weights = weights[valid_mask]
+            total_weight = valid_weights.sum()
+            if total_weight < 1:
+                loss = losses.sum() * 0.0
+            else:
+                loss = (losses[valid_mask] * valid_weights).sum() / total_weight
+        else:
+            loss = losses.mean()
         return loss

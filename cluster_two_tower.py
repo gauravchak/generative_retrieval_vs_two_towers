@@ -53,7 +53,7 @@ class ClusterSoftmaxTowTower(TwoTowerBasic):
         )
         self.cluster_loss_weight = cluster_loss_weight
         self.cluster_embeddings = nn.Parameter(
-            torch.randn(cluster_vocab_size, hidden_dim) * (hidden_dim ** -0.5)
+            torch.randn(cluster_vocab_size, hidden_dim) * (hidden_dim**-0.5)
         )
         self.cluster_bias = nn.Parameter(torch.zeros(cluster_vocab_size))
         self.cluster_loss_fn = nn.CrossEntropyLoss(reduction="none")
@@ -77,7 +77,9 @@ class ClusterSoftmaxTowTower(TwoTowerBasic):
         """
         embeddings = self._encode_items(item_static_features).detach()
         if cluster_ids is not None:
-            cluster_vecs = self.cluster_embeddings[cluster_ids.to(embeddings.device)].detach()
+            cluster_vecs = self.cluster_embeddings[
+                cluster_ids.to(embeddings.device)
+            ].detach()
             embeddings = embeddings + cluster_vecs
         self.cached_item_embeddings = embeddings
         self.cached_item_ids = item_ids.clone()
@@ -100,16 +102,22 @@ class ClusterSoftmaxTowTower(TwoTowerBasic):
         """
         embeddings = self._encode_items(item_static_features).detach()
         if cluster_ids is not None:
-            cluster_vecs = self.cluster_embeddings[cluster_ids.to(embeddings.device)].detach()
+            cluster_vecs = self.cluster_embeddings[
+                cluster_ids.to(embeddings.device)
+            ].detach()
             embeddings = embeddings + cluster_vecs
         if self.cached_item_embeddings is None:
             self.cached_item_embeddings = embeddings
         else:
-            self.cached_item_embeddings = torch.cat([self.cached_item_embeddings, embeddings], dim=0)
+            self.cached_item_embeddings = torch.cat(
+                [self.cached_item_embeddings, embeddings], dim=0
+            )
         if self.cached_item_ids is None:
             self.cached_item_ids = item_ids.clone()
         else:
-            self.cached_item_ids = torch.cat([self.cached_item_ids, item_ids.clone()], dim=0)
+            self.cached_item_ids = torch.cat(
+                [self.cached_item_ids, item_ids.clone()], dim=0
+            )
 
     def train_forward(
         self,
@@ -137,36 +145,51 @@ class ClusterSoftmaxTowTower(TwoTowerBasic):
         """
         del semantic_ids, candidate_item_static_features
         if cluster_ids is None:
-            raise ValueError("cluster_ids is required for ClusterSoftmaxTowTower.")
+            raise ValueError(
+                "cluster_ids is required for ClusterSoftmaxTowTower."
+            )
         device = user_static_features.device
-        user_repr = self._encode_user(user_sequence_features, user_static_features)
-        positive_item = self._encode_items(item_static_features)
-
-        negatives = self.oob_sampler.sample_negatives(item_static_features)
-        neg_flat = negatives.view(-1, item_static_features.shape[-1])
-        negative_repr = self._encode_items(neg_flat)
-        negative_repr = negative_repr.view(
-            item_static_features.size(0), negatives.size(1), -1
+        user_repr = self._encode_user(
+            user_sequence_features, user_static_features
         )
 
-        stacked_items = torch.cat([positive_item.unsqueeze(1), negative_repr], dim=1)
-        logits = torch.sum(user_repr.unsqueeze(1) * stacked_items, dim=-1)
+        candidates = self.oob_sampler.get_candidates(item_static_features)
+        candidate_repr = self._encode_items(candidates)
+
+        logits = torch.einsum("bd,bkd->bk", user_repr, candidate_repr)
 
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=device)
         losses = self.loss_fn(logits, labels)
 
         if reward_weights is not None:
             weights = reward_weights.to(device)
-            item_loss = (losses * weights).sum() / weights.sum().clamp_min(1e-6)
+            valid_mask = weights > 0
+            valid_weights = weights[valid_mask]
+            total_weight = valid_weights.sum()
+            if total_weight < 1:
+                item_loss = losses.sum() * 0.0
+            else:
+                item_loss = (
+                    losses[valid_mask] * valid_weights
+                ).sum() / total_weight
         else:
             item_loss = losses.mean()
 
         # Cluster full-softmax quickly teaches coarse cluster separation before
         # item-level sampled-softmax has fully converged.
-        cluster_logits = user_repr @ self.cluster_embeddings.t() + self.cluster_bias
-        cluster_losses = self.cluster_loss_fn(cluster_logits, cluster_ids.to(device))
+        cluster_logits = (
+            user_repr @ self.cluster_embeddings.t() + self.cluster_bias
+        )
+        cluster_losses = self.cluster_loss_fn(
+            cluster_logits, cluster_ids.to(device)
+        )
         if reward_weights is not None:
-            cluster_loss = (cluster_losses * weights).sum() / weights.sum().clamp_min(1e-6)
+            if total_weight < 1:
+                cluster_loss = cluster_losses.sum() * 0.0
+            else:
+                cluster_loss = (
+                    cluster_losses[valid_mask] * valid_weights
+                ).sum() / total_weight
         else:
             cluster_loss = cluster_losses.mean()
 

@@ -9,7 +9,9 @@ from two_tower_basic import TwoTowerBasic
 class MoEFFN(nn.Module):
     """Small dense MoE-FFN used inside each decoder block."""
 
-    def __init__(self, hidden_dim: int, ffn_dim: int, num_experts: int, dropout: float) -> None:
+    def __init__(
+        self, hidden_dim: int, ffn_dim: int, num_experts: int, dropout: float
+    ) -> None:
         super().__init__()
         self.gate = nn.Linear(hidden_dim, num_experts)
         self.experts = nn.ModuleList(
@@ -37,7 +39,9 @@ class MoEFFN(nn.Module):
         # x: [B, T, D]
         gate_probs = torch.softmax(self.gate(x), dim=-1)
         # gate_probs: [B, T, num_experts]
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=-1)
+        expert_outputs = torch.stack(
+            [expert(x) for expert in self.experts], dim=-1
+        )
         # expert_outputs: [B, T, D, num_experts]
         mixed = torch.sum(expert_outputs * gate_probs.unsqueeze(2), dim=-1)
         # mixed: [B, T, D]
@@ -168,7 +172,10 @@ class GenerativeRetrieval(TwoTowerBasic):
             user_static_dim, user_static_token_count * hidden_dim
         )
         self.user_positional = nn.Parameter(
-            torch.randn(user_sequence_length + user_static_token_count, hidden_dim) * 0.02
+            torch.randn(
+                user_sequence_length + user_static_token_count, hidden_dim
+            )
+            * 0.02
         )
         self.semantic_embedding = nn.Embedding(semantic_vocab_size, hidden_dim)
         self.semantic_positional = nn.Parameter(
@@ -217,11 +224,15 @@ class GenerativeRetrieval(TwoTowerBasic):
                 f"User token length {user_memory.size(1)} exceeds positional table "
                 f"size {self.user_positional.size(0)}"
             )
-        user_memory = user_memory + self.user_positional[: user_memory.size(1)].unsqueeze(0)
+        user_memory = user_memory + self.user_positional[
+            : user_memory.size(1)
+        ].unsqueeze(0)
         # user_memory: [B, L + S_static, hidden_dim]
         return user_memory
 
-    def _build_static_tokens(self, user_static_features: torch.Tensor) -> torch.Tensor:
+    def _build_static_tokens(
+        self, user_static_features: torch.Tensor
+    ) -> torch.Tensor:
         """Convert static features into static token embeddings.
 
         Args:
@@ -232,13 +243,18 @@ class GenerativeRetrieval(TwoTowerBasic):
             Static tokens with shape ``[B, S_static, hidden_dim]``.
         """
         if user_static_features.dim() == 3:
-            if user_static_features.size(-1) != self.user_token_projection.out_features:
+            if (
+                user_static_features.size(-1)
+                != self.user_token_projection.out_features
+            ):
                 raise ValueError(
                     "3D user_static_features must have last dimension equal to hidden_dim."
                 )
             return user_static_features
         if user_static_features.dim() != 2:
-            raise ValueError("user_static_features must be [B, F] or [B, S, D].")
+            raise ValueError(
+                "user_static_features must be [B, F] or [B, S, D]."
+            )
         projected = self.user_static_token_projection(user_static_features)
         return projected.view(
             user_static_features.size(0),
@@ -246,7 +262,9 @@ class GenerativeRetrieval(TwoTowerBasic):
             self.user_token_projection.out_features,
         )
 
-    def _causal_mask(self, target_len: int, device: torch.device) -> torch.Tensor:
+    def _causal_mask(
+        self, target_len: int, device: torch.device
+    ) -> torch.Tensor:
         """Build a causal mask for decoder self-attention.
 
         Args:
@@ -257,7 +275,8 @@ class GenerativeRetrieval(TwoTowerBasic):
             Boolean mask with shape ``[T, T]`` where ``True`` entries are masked.
         """
         return torch.triu(
-            torch.ones(target_len, target_len, dtype=torch.bool, device=device), diagonal=1
+            torch.ones(target_len, target_len, dtype=torch.bool, device=device),
+            diagonal=1,
         )
 
     def train_forward(
@@ -288,13 +307,17 @@ class GenerativeRetrieval(TwoTowerBasic):
         del item_static_features, cluster_ids, candidate_item_static_features
         device = user_static_features.device
         if semantic_ids is None:
-            raise ValueError("semantic_ids is required for GenerativeRetrieval.")
+            raise ValueError(
+                "semantic_ids is required for GenerativeRetrieval."
+            )
         if semantic_ids.size(1) != self.semantic_seq_len:
             raise ValueError(
                 f"Expected semantic_ids with length {self.semantic_seq_len}, "
                 f"got {semantic_ids.size(1)}"
             )
-        user_memory = self._encode_user_tokens(user_sequence_features, user_static_features)
+        user_memory = self._encode_user_tokens(
+            user_sequence_features, user_static_features
+        )
         # user_memory: [B, L + S_static, hidden_dim]
 
         decoder_input = semantic_ids[:, :-1]
@@ -302,7 +325,9 @@ class GenerativeRetrieval(TwoTowerBasic):
         # decoder_input/decoder_target: [B, S-1]
 
         generated = self.semantic_embedding(decoder_input)
-        generated = generated + self.semantic_positional[: decoder_input.size(1)].unsqueeze(0)
+        generated = generated + self.semantic_positional[
+            : decoder_input.size(1)
+        ].unsqueeze(0)
         # generated: [B, S-1, hidden_dim]
 
         causal_mask = self._causal_mask(generated.size(1), device)
@@ -321,6 +346,15 @@ class GenerativeRetrieval(TwoTowerBasic):
 
         if reward_weights is not None:
             # reward_weights: [B] -> token-aligned weights [B, S-1]
-            token_weights = reward_weights.to(device).unsqueeze(1).expand_as(token_losses)
-            return (token_losses * token_weights).sum() / token_weights.sum().clamp_min(1e-6)
+            token_weights = (
+                reward_weights.to(device).unsqueeze(1).expand_as(token_losses)
+            )
+            valid_mask = token_weights > 0
+            valid_weights = token_weights[valid_mask]
+            total_weight = valid_weights.sum()
+            if total_weight < 1:
+                return token_losses.sum() * 0.0
+            return (
+                token_losses[valid_mask] * valid_weights
+            ).sum() / total_weight
         return token_losses.mean()

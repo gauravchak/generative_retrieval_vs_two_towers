@@ -67,7 +67,10 @@ class UnifiedRetrieval(TwoTowerBasic):
             user_static_dim, user_static_token_count * hidden_dim
         )
         self.user_positional = nn.Parameter(
-            torch.randn(user_sequence_length + user_static_token_count, hidden_dim) * 0.02
+            torch.randn(
+                user_sequence_length + user_static_token_count, hidden_dim
+            )
+            * 0.02
         )
         self.semantic_embedding = nn.Embedding(semantic_vocab_size, hidden_dim)
         self.semantic_positional = nn.Parameter(
@@ -88,7 +91,9 @@ class UnifiedRetrieval(TwoTowerBasic):
         self.output_proj = nn.Linear(hidden_dim, semantic_vocab_size)
         self.semantic_loss_fn = nn.CrossEntropyLoss(reduction="none")
 
-    def _build_static_tokens(self, user_static_features: torch.Tensor) -> torch.Tensor:
+    def _build_static_tokens(
+        self, user_static_features: torch.Tensor
+    ) -> torch.Tensor:
         """Convert static user inputs into static tokens.
 
         Args:
@@ -99,13 +104,18 @@ class UnifiedRetrieval(TwoTowerBasic):
             Static tokens with shape ``[B, S_static, hidden_dim]``.
         """
         if user_static_features.dim() == 3:
-            if user_static_features.size(-1) != self.user_token_projection.out_features:
+            if (
+                user_static_features.size(-1)
+                != self.user_token_projection.out_features
+            ):
                 raise ValueError(
                     "3D user_static_features must have last dimension equal to hidden_dim."
                 )
             return user_static_features
         if user_static_features.dim() != 2:
-            raise ValueError("user_static_features must be [B, F] or [B, S, D].")
+            raise ValueError(
+                "user_static_features must be [B, F] or [B, S, D]."
+            )
         projected = self.user_static_token_projection(user_static_features)
         return projected.view(
             user_static_features.size(0),
@@ -140,10 +150,14 @@ class UnifiedRetrieval(TwoTowerBasic):
                 f"User token length {user_memory.size(1)} exceeds positional table "
                 f"size {self.user_positional.size(0)}"
             )
-        user_memory = user_memory + self.user_positional[: user_memory.size(1)].unsqueeze(0)
+        user_memory = user_memory + self.user_positional[
+            : user_memory.size(1)
+        ].unsqueeze(0)
         return user_memory
 
-    def _causal_mask(self, target_len: int, device: torch.device) -> torch.Tensor:
+    def _causal_mask(
+        self, target_len: int, device: torch.device
+    ) -> torch.Tensor:
         """Build a causal self-attention mask.
 
         Args:
@@ -154,7 +168,8 @@ class UnifiedRetrieval(TwoTowerBasic):
             Boolean causal mask with shape ``[T, T]``.
         """
         return torch.triu(
-            torch.ones(target_len, target_len, dtype=torch.bool, device=device), diagonal=1
+            torch.ones(target_len, target_len, dtype=torch.bool, device=device),
+            diagonal=1,
         )
 
     def _decode_teacher_forcing(
@@ -182,7 +197,9 @@ class UnifiedRetrieval(TwoTowerBasic):
         decoder_target = semantic_ids[:, 1:]
         # decoder_input/decoder_target: [B, S-1]
         generated = self.semantic_embedding(decoder_input)
-        generated = generated + self.semantic_positional[: decoder_input.size(1)].unsqueeze(0)
+        generated = generated + self.semantic_positional[
+            : decoder_input.size(1)
+        ].unsqueeze(0)
         # generated: [B, S-1, hidden_dim]
         causal_mask = self._causal_mask(generated.size(1), device)
         x = generated
@@ -196,8 +213,17 @@ class UnifiedRetrieval(TwoTowerBasic):
         ).view(logits.size(0), logits.size(1))
         # token_losses: [B, S-1]
         if reward_weights is not None:
-            token_weights = reward_weights.to(device).unsqueeze(1).expand_as(token_losses)
-            return (token_losses * token_weights).sum() / token_weights.sum().clamp_min(1e-6)
+            token_weights = (
+                reward_weights.to(device).unsqueeze(1).expand_as(token_losses)
+            )
+            valid_mask = token_weights > 0
+            valid_weights = token_weights[valid_mask]
+            total_weight = valid_weights.sum()
+            if total_weight < 1:
+                return token_losses.sum() * 0.0
+            return (
+                token_losses[valid_mask] * valid_weights
+            ).sum() / total_weight
         return token_losses.mean()
 
     def train_forward(
@@ -237,7 +263,9 @@ class UnifiedRetrieval(TwoTowerBasic):
             reward_weights=reward_weights,
         )
         # Generative branch: user memory tokens + teacher forcing semantic CE.
-        user_memory = self._encode_user_tokens(user_sequence_features, user_static_features)
+        user_memory = self._encode_user_tokens(
+            user_sequence_features, user_static_features
+        )
         generation_loss = self._decode_teacher_forcing(
             user_memory=user_memory,
             semantic_ids=semantic_ids,
@@ -272,7 +300,9 @@ class UnifiedRetrieval(TwoTowerBasic):
             Generated semantic id sequences with shape ``[B, semantic_seq_len]``.
         """
         device = user_sequence_features.device
-        user_memory = self._encode_user_tokens(user_sequence_features, user_static_features)
+        user_memory = self._encode_user_tokens(
+            user_sequence_features, user_static_features
+        )
         batch_size = user_sequence_features.size(0)
         generated_ids = torch.full(
             (batch_size, 1), bos_token_id, dtype=torch.long, device=device

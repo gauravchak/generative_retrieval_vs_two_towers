@@ -42,27 +42,34 @@ class OOBNegativeSampler:
             self.write_ptr = (self.write_ptr + 1) % self.pool_size
             self.filled = min(self.filled + 1, self.pool_size)
 
-    def sample_negatives(self, positives: torch.Tensor) -> torch.Tensor:
-        """Sample out-of-batch negatives and update the memory bank.
+    def get_candidates(self, positives: torch.Tensor) -> torch.Tensor:
+        """Sample out-of-batch negatives and prepend the positive items.
 
         Args:
             positives: Current positive item features with shape ``[B, F2]``.
 
         Returns:
-            Sampled negatives with shape ``[B, oob_negative_count, F2]``.
+            Candidates with shape ``[B, 1 + oob_negative_count, F2]`` where index 0 is positive.
         """
         batch_size = positives.shape[0]
         self._ingest(positives.detach())
 
         if self.filled == 0:
-            return positives.unsqueeze(1).expand(-1, self.oob_negative_count, -1)
+            negatives = positives.unsqueeze(1).expand(
+                -1, self.oob_negative_count, -1
+            )
+        else:
+            max_index = self.filled
+            sample_count = batch_size * self.oob_negative_count
+            indices = torch.randint(
+                max_index, (sample_count,), device=self.pool.device
+            )
+            negatives = self.pool[indices]
+            negatives = negatives.to(positives.device).view(
+                batch_size, self.oob_negative_count, self.feature_dim
+            )
 
-        max_index = self.filled
-        sample_count = batch_size * self.oob_negative_count
-        indices = torch.randint(max_index, (sample_count,), device=self.pool.device)
-        negatives = self.pool[indices]
-        negatives = negatives.to(positives.device)
-        return negatives.view(batch_size, self.oob_negative_count, self.feature_dim)
+        return torch.cat([positives.unsqueeze(1), negatives], dim=1)
 
 
 class TwoTowerBasic(nn.Module):
@@ -151,12 +158,11 @@ class TwoTowerBasic(nn.Module):
         """Encode item-side static features into the retrieval space.
 
         Args:
-            item_static_features: Item features with shape ``[N, F2]``.
+            item_static_features: Item features with shape ``[..., F2]``.
 
         Returns:
-            Item embeddings with shape ``[N, hidden_dim]``.
+            Item embeddings with shape ``[..., hidden_dim]``.
         """
-        # item_static_features: [B, F2]
         return self.item_encoder(item_static_features)
 
     def build_item_index(
@@ -230,8 +236,12 @@ class TwoTowerBasic(nn.Module):
         if self.cached_item_embeddings is None:
             raise RuntimeError("Call `build_item_index` before retrieval.")
         if self.cached_item_ids is None:
-            raise RuntimeError("Item ids were not loaded. Rebuild index with item_ids.")
-        user_repr = self._encode_user(user_sequence_features, user_static_features)
+            raise RuntimeError(
+                "Item ids were not loaded. Rebuild index with item_ids."
+            )
+        user_repr = self._encode_user(
+            user_sequence_features, user_static_features
+        )
         # logits: [B, num_cached_items]
         logits = user_repr @ self.cached_item_embeddings.t()
         max_k = min(topk, logits.size(1))
@@ -269,27 +279,28 @@ class TwoTowerBasic(nn.Module):
         """
         del cluster_ids, semantic_ids, candidate_item_static_features
         device = user_static_features.device
-        user_repr = self._encode_user(user_sequence_features, user_static_features)
-        positive_item = self._encode_items(item_static_features)
-
-        negatives = self.oob_sampler.sample_negatives(item_static_features)
-        neg_flat = negatives.view(-1, item_static_features.shape[-1])
-        negative_repr = self._encode_items(neg_flat)
-        negative_repr = negative_repr.view(
-            item_static_features.size(0), negatives.size(1), -1
+        user_repr = self._encode_user(
+            user_sequence_features, user_static_features
         )
 
-        stacked_items = torch.cat([positive_item.unsqueeze(1), negative_repr], dim=1)
-        # stacked_items: [B, 1 + num_oob, hidden_dim]
-        logits = torch.sum(user_repr.unsqueeze(1) * stacked_items, dim=-1)
+        candidates = self.oob_sampler.get_candidates(item_static_features)
+        candidate_repr = self._encode_items(candidates)
+        # candidate_repr: [B, 1 + num_oob, hidden_dim]
+
+        logits = torch.einsum("bd,bkd->bk", user_repr, candidate_repr)
         # logits: [B, 1 + num_oob]
 
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=device)
         losses = self.loss_fn(logits, labels)
         if reward_weights is not None:
-            losses = losses * reward_weights.to(device)
-            denominator = reward_weights.to(device).sum().clamp_min(1e-6)
-            loss = losses.sum() / denominator
+            weights = reward_weights.to(device)
+            valid_mask = weights > 0
+            valid_weights = weights[valid_mask]
+            total_weight = valid_weights.sum()
+            if total_weight < 1:
+                loss = losses.sum() * 0.0
+            else:
+                loss = (losses[valid_mask] * valid_weights).sum() / total_weight
         else:
             loss = losses.mean()
         return loss
